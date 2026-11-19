@@ -1,325 +1,148 @@
-# ERA5-Land Precipitation Prediction with XAI
+# Explicabilidade na estimação de precipitação com dados do ERA5-Land no Brasil
 
-Precipitation prediction from ERA5-Land reanalysis data, with a focus on
-explainable (XAI) modelling.
+*Explainability in precipitation estimation with ERA5-Land data in Brazil*
 
-**Authors**
-
-- Osmary Camila Bortoncello Glober
-- Vitor Gabriel Pignatari
-- Israel Matias
-- Anderson Ara
-
-## Data
-
-The dataset is stored outside this repository, on an external drive.
-
-ERA5-Land is the land-surface component of the ERA5 reanalysis, produced by
-ECMWF: hourly, on a regular 0.1° × 0.1° grid (~9 km), over land points only,
-from 1950 to present. Our subset covers **1980-01 to 2025-12** over South
-America (6°N–35°S, 75°W–30°W; 411 × 451 grid points).
-
-### Raw data
-
-```
-/media/mary-camila/Expansion/era5land/raw/
-├── pev/    pev_YYYY_MM.nc     pev       — potential evaporation
-├── ssrd/   ssrd_YYYY_MM.nc    ssrd      — surface solar radiation downwards
-├── temp/   temp_YYYY_MM.nc    t2m, d2m  — 2 m temperature and dewpoint
-├── tp/     tp_YYYY_MM.nc      tp        — total precipitation (target)
-└── wind/   wind_YYYY_MM.nc    u10, v10  — 10 m wind components
-```
-
-One NetCDF file per group per month, hourly (552 files per folder, ~597 GB in
-total). Note that `temp` and `wind` each hold **two** variables.
-
-| Folder | Variable(s) | ECMWF name | Units | Type |
-|--------|-------------|------------|-------|------|
-| `tp`   | `tp`         | Total precipitation | m | accumulated |
-| `pev`  | `pev`        | Potential evaporation | m | accumulated |
-| `ssrd` | `ssrd`       | Surface solar radiation downwards | J m⁻² | accumulated |
-| `temp` | `t2m`, `d2m` | 2 m temperature, 2 m dewpoint temperature | K | instantaneous |
-| `wind` | `u10`, `v10` | 10 m u- and v-component of wind | m s⁻¹ | instantaneous |
-
-#### `tp` — total precipitation
-
-Rain plus snow reaching the surface, as a **depth of water in metres**; the sum
-of large-scale and convective precipitation, excluding fog, dew, and rain that
-evaporates before landing. This is the **prediction target**. Multiply by 1000
-for millimetres.
-
-#### `pev` — potential evaporation
-
-The evaporation that *would* occur if water were not limiting — atmospheric
-demand for water, in **metres**.
-
-- **Sign**: ECMWF treats downward fluxes as positive, so evaporation is
-  **negative**. Negate it (`-pev`) for a positive demand predictor; do *not*
-  use `abs()`. About 0.1% of land cells are genuinely positive (condensation),
-  and `abs()` would silently flip those into demand.
-- **Magnitude**: in ERA5-Land `pev` is an **open-water (pan) evaporation**,
-  computed differently from ERA5 and *not* FAO-56 reference ET. It averages
-  ~9.6 mm/day over this domain, well above reference ET, and ECMWF warn it "can
-  give unrealistic results in arid conditions". Use it as a relative demand
-  index, not in a water balance expecting realistic ET.
-
-With `tp` it gives an aridity signal (`tp` + `pev`, since `pev` is negative).
-
-#### `ssrd` — surface solar radiation downwards
-
-Direct plus diffuse solar radiation reaching the surface after the atmosphere —
-mainly clouds — has modified it. Accumulated energy per area, in **J m⁻²**.
-
-Per ECMWF the accumulated value is divided by **the length of its accumulation
-window** in seconds, not by a fixed 3600. The raw values accumulate from 00 UTC
-(see [Accumulated vs. instantaneous](#accumulated-vs-instantaneous)), so
-dividing a raw value by 3600 gives nonsense — ~7000 W m⁻² at the end-of-day
-step, five times the solar constant.
-
-| Value | To W m⁻² |
-|-------|----------|
-| raw hourly, after `.diff('valid_time')` | ÷ 3600 |
-| `processed_daily` (daily total) | ÷ 86400 |
-| `processed_weekly` (weekly total) | ÷ 604800 |
-
-Low `ssrd` against the clear-sky maximum is a cloud-cover proxy, which is why
-it informs precipitation. Not to be confused with **surface net solar
-radiation** (`ssr`), which has albedo folded in and is a weaker cloud proxy.
-
-#### `t2m`, `d2m` — 2 m temperature and dewpoint
-
-Both in **kelvin**; subtract 273.15 for °C. `d2m` is the temperature at which
-the air at 2 m would saturate. The pair gives near-surface humidity: the
-dewpoint depression (`t2m` − `d2m`) goes to zero as the air saturates. Moisture
-availability is a direct precursor of precipitation, so the pair is more
-informative than `t2m` alone.
-
-#### `u10`, `v10` — 10 m wind components
-
-Horizontal wind at 10 m, in **m s⁻¹**: `u10` eastward, `v10` northward.
-
-Averaging these two alone over a day or a week is a **vector mean**, and it
-misleads on exactly the interesting days: twelve hours of westerly at 4 m s⁻¹
-followed by twelve hours of easterly at 4 m s⁻¹ average to `u10 = 0`, reading
-as "no wind" when in fact the wind blew all day and the direction swung — what
-a frontal passage looks like. The pipeline therefore also stores the **scalar**
-mean speed and the period maximum, and the feature tables derive the rest:
-
-| Column | Formula | What it measures |
-|--------|---------|------------------|
-| `u10`, `v10` | mean of the components | the mean vector |
-| `wind_speed` | mean of √(u²+v²) | how hard it actually blew |
-| `wind_max` | max of √(u²+v²) | the peak, a frontal-passage marker |
-| `wind_res` | √(ū² + v̄²) | the net transport |
-| `wind_const` | `wind_res` / `wind_speed` | how steady the direction was |
-| `wind_dir_sin`, `wind_dir_cos` | sin/cos of the resultant direction | direction, without the 359 → 0 jump |
-
-`wind_const` is 1 when the wind held one direction all period (real moisture
-advection) and ~0 when it cancelled itself out; since `wind_speed ≥ wind_res`
-always, it stays in [0, 1], and it is NaN on a dead calm. It is the classical
-*constancy* or *steadiness* of the wind (Singer 1967); scalar, directional and
-vector statistics carry non-redundant information about a wind field (Klink
-1998). The formulas live in
-[scripts/utils/wind_stats.py](scripts/utils/wind_stats.py), used by both the
-daily and the weekly pipeline, and are covered by
-[tests/test_wind_stats.py](tests/test_wind_stats.py).
-
-### Processed data
-
-Raw files are aggregated to **daily** files in `processed_daily/`, mirroring
-the raw folder structure and naming, so any raw path maps to its processed
-counterpart by swapping `raw` for `processed_daily`. Generated by
-[scripts/processing/daily_aggregation.py](scripts/processing/daily_aggregation.py).
-
-#### Accumulated vs. instantaneous
-
-This distinction determines how each variable must be aggregated.
-
-**Instantaneous** variables (`t2m`, `d2m`, `u10`, `v10`) are snapshots valid at
-the timestamp, so they are averaged.
-
-**Accumulated** variables (`tp`, `pev`, `ssrd`) accumulate **from 00 UTC of the
-same day**, not over the preceding hour: the value at 06 UTC is the total for
-00–06 UTC, growing through the day and resetting. So:
-
-- **Summing the 24 hourly values badly overcounts.** The daily total is the
-  *last* step of the day — the value stamped 00 UTC of the following day.
-- To recover hourly rates, difference consecutive steps within the day
-  (`x.diff('valid_time')`), keeping the 01 UTC value as-is.
-- The resulting day is a **UTC day**. Far from Greenwich this matters: in
-  Curitiba (UTC−3) the day starts at 21 h local time of the previous day.
-
-| File | Variable(s) | Daily aggregation |
-|------|-------------|-------------------|
-| `tp`, `pev`, `ssrd` | `tp`, `pev`, `ssrd` | last accumulated step of the day (00 UTC of the next day) |
-| `temp` | `t2m`, `d2m` | mean, plus `t2m_min` and `t2m_max` |
-| `wind` | `u10`, `v10` | vector mean, plus `wind_speed` and `wind_max` |
-
-The daily total of the last day of a month is read from the first timestep of
-the next month's file. For 2025-12 that file does not exist, so its last day is
-skipped and a warning is printed.
-
-#### Weekly aggregation
-
-Daily files are aggregated to **ISO weeks** (Monday–Sunday) in
-`processed_weekly/`, by
-[scripts/processing/weekly_aggregation.py](scripts/processing/weekly_aggregation.py).
-The group folders mirror the raw data, but because weeks cross month boundaries
-there is **one file per year** (`tp_YYYY.nc`) rather than per month. Each week
-is labelled by its Monday and belongs to the year holding that Monday, so
-building one year also reads January of the next; no week is split or written
-twice.
-
-| File | Variable(s) | Weekly aggregation |
-|------|-------------|--------------------|
-| `tp`, `pev`, `ssrd` | `tp`, `pev`, `ssrd` | sum of the 7 daily totals |
-| `temp` | `t2m`, `d2m` | mean; `t2m_min` = min of daily minima, `t2m_max` = max of daily maxima |
-| `wind` | `u10`, `v10`, `wind_speed` | mean; `wind_max` = max of daily maxima |
-
-Every day carries the same 24 hours, so the mean of the daily means is the mean
-over the week — for the scalar speed as much as for the components.
-
-Weeks with fewer than 7 daily values are **dropped**, so every weekly value
-covers a full week. In practice this removes 1980-01-01 to 01-06 (the archive
-starts on a Tuesday) and the last days of 2025-12. `pev` keeps its negative
-ECMWF sign throughout.
-
-## AT2 — Curitiba daily table
-
-The XAI coursework activity lives in [at2/](at2/): a single ERA5-Land grid cell
-over Curitiba, one row per UTC day, set up as a t+1 forecast — the target is
-day t's rain and every predictor comes from t−1 or earlier. It has its own
-[README](at2/README.md) with the column dictionary and the references.
-
-AT3, in [at3/](at3/), filters the same table to heavy-rain days (≥ 10 mm), fits a
-quantile gradient boosting model for the 90th percentile of the day's rain and
-explains it with CP, ICE, LIME and SHAP (the classification part is built
-separately); see its [README](at3/README.md). The table and the scripts that build it
-are shared by both activities and live in [commons/](commons/).
-
-## Repository layout
-
-```
-.
-├── commons/                 shared by the XAI activities (AT2 and AT3)
-│   ├── build_curitiba_daily.py      the Curitiba daily table
-│   ├── synoptic.py, subdaily.py, bands.py   extra columns for AT3
-│   ├── boundaries.py                IBGE municipal/state outlines
-│   └── data/                curitiba_daily.parquet and the extra tables
-├── at2/                     Curitiba daily table (XAI coursework, AT2)
-│   ├── analysis/            atv2_arvore.ipynb
-│   ├── plot/                plot_month.py, animate_month.py
-│   └── README.md
-├── at3/                     heavy rain: regression, classification, local XAI
-│   ├── analysis/            notebooks, figures, saved models
-│   ├── relatorio/           report (LaTeX, SBC template)
-│   └── evaluation.py        date folds and baselines for the filtered table
-├── figures/                 maps and animations, versioned
-├── notebooks/               exploration, modelling and XAI notebooks
-├── scripts/
-│   ├── processing/
-│   │   ├── daily_aggregation.py     hourly raw → processed_daily
-│   │   └── weekly_aggregation.py    daily → processed_weekly
-│   └── utils/
-│       └── wind_stats.py            wind aggregation, shared by both
-├── tests/
-├── pyproject.toml           dependencies (uv)
-└── README.md
-```
-
-## Setup
-
-Dependencies are managed with [uv](https://docs.astral.sh/uv/) (Python >= 3.12):
-
-```bash
-uv sync --group dev
-```
-
-Core packages: `xarray`, `netCDF4`, `dask`, `numpy`, `pandas`, `pyarrow`; the
-`dev` group adds `jupyterlab` and `pytest`.
-
-## How to run
-
-**1. Check the external drive is mounted.** Everything reads from and writes to
-`/media/mary-camila/Expansion/era5land/`; the paths sit at the top of each
-script.
-
-```bash
-ls /media/mary-camila/Expansion/era5land/raw
-```
-
-**2. Build the daily dataset**, then the weekly one.
-
-```bash
-uv run python scripts/processing/daily_aggregation.py
-uv run python scripts/processing/weekly_aggregation.py
-```
-
-Both skip files that already exist, so a re-run only fills in what is missing.
-**After a change to the wind aggregation this means the old wind files must be
-deleted by hand**, or they will be kept as they are:
-
-```bash
-rm -r /media/mary-camila/Expansion/era5land/processed_daily/wind
-rm -r /media/mary-camila/Expansion/era5land/processed_weekly/wind
-```
-
-**3. Build the Curitiba table.**
-
-```bash
-uv run python -m commons.build_curitiba_daily
-uv run python -m at2.plot.plot_month 2025-01
-uv run python -m at2.plot.animate_month 2025-01
-```
-
-**4. Run the tests.**
-
-```bash
-uv run python -m pytest
-```
-
-**5. Explore and model.**
-
-```bash
-uv run jupyter lab
-```
-
-Notebooks live in `notebooks/`:
-
-```python
-import xarray as xr
-import pandas as pd
-
-tp = xr.open_mfdataset(
-    "/media/mary-camila/Expansion/era5land/processed_daily/tp/tp_*.nc"
-).tp * 1000  # mm/day
-
-curitiba = pd.read_parquet("commons/data/curitiba_daily.parquet")
-```
-
-## Notes
-
-Data is not versioned in git — that includes `commons/data/curitiba_daily.parquet`,
-which `.gitignore` excludes through the `data/` rule. It is 2.9 MB and rebuilds
-in a few minutes; add `!commons/data/` to `.gitignore` if the coursework should
-carry the table with it. `tests/` is also excluded.
-
-## Source and citation
-
-The raw data is the gridded **ERA5-Land hourly** dataset from the Copernicus
-Climate Data Store. Its overview page carries the authoritative list of all 50
-available variables with units and full descriptions; this project uses the six
-listed under [Raw data](#raw-data).
-
-- Dataset: [ERA5-Land hourly data from 1950 to present](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land?tab=overview)
-  — DOI [10.24381/cds.e2161bac](https://doi.org/10.24381/cds.e2161bac), CC-BY licence
-- Documentation: [ERA5-Land: data documentation](https://confluence.ecmwf.int/display/CKB/ERA5-Land%3A+data+documentation)
-  (ECMWF Confluence) — accumulation conventions, known issues
-- Reference paper: Muñoz-Sabater, J., Dutra, E., Agustí-Panareda, A., et al.,
-  *ERA5-Land: A state-of-the-art global reanalysis dataset for land
-  applications*, Earth Syst. Sci. Data, 13, 4349–4383, 2021.
-  <https://doi.org/10.5194/essd-13-4349-2021>
-- Wind aggregation: Singer, I. A., *Steadiness of the Wind*, J. Appl. Meteor.,
-  6, 1033–1038, 1967; Klink, K., *Complementary Use of Scalar, Directional, and
-  Vector Statistics with an Application to Surface Winds*, The Professional
-  Geographer, 50(1), 3–13, 1998. Full list in [at2/README.md](at2/README.md#referências).
+Osmary Camila Bortoncello Glober, Vitor Gabriel Pignatari, Israel Matias e Anderson Ara
+Universidade Federal do Paraná (UFPR)
+
+Pôster apresentado na **70ª RBras**. Poster presented at the **70th RBras**.
+
+| | |
+|---|---|
+| **Pôster** · *Poster* | [papers/rbras70_poster.pdf](papers/rbras70_poster.pdf) |
+| **Versão estendida (artigo)** · *Extended version (paper)* | [papers/av1_artigo.pdf](papers/av1_artigo.pdf) |
+| **Código** · *Code* | [av1/](av1/) |
+| **Dados** · *Data* | ERA5-Land ([Copernicus](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land?tab=overview)), gerados pelos scripts de [av1/](av1/) |
+
+[Português](#português) · [English](#english)
+
+<a href="papers/rbras70_poster.pdf"><img src="papers/rbras70_poster.png" alt="Pôster da 70ª RBras" width="560"></a>
+
+---
+
+## Português
+
+### Mensagem principal
+
+O SHAP mostra que cada região usa sinais diferentes para prever chuva forte, e isso ajuda a
+explicar por que os modelos do Norte falham no Sul.
+
+Para ver os detalhes, comece pelo [pôster](papers/rbras70_poster.pdf). A
+[versão estendida](papers/av1_artigo.pdf) traz o método completo, a validação, todas as
+figuras e também um primeiro experimento, que estima a chuva do mesmo dia só a partir das
+vizinhas.
+
+### Em resumo
+
+- **Dados.** ERA5-Land diário, de 0,1°, de 1980 a 2025, com 512 âncoras nas sedes
+  municipais do IBGE, cada uma ligada a 8 vizinhas entre 123 e 145 km.
+- **Alvo.** O percentil 90 (p90) da chuva do dia seguinte nos dias com 10 mm ou mais,
+  previsto só com variáveis da véspera, sem latitude, longitude ou altitude.
+- **Modelo.** *Gradient boosting* com perda quantílica, um modelo por região, com e sem as
+  variáveis de grafo, e validação em blocos de anos e em âncoras fora do treino.
+- **Resultado.** No teste, de 2015 a 2025, o ganho sobre a climatologia local é este.
+
+  | | N | NE | CO | SE | S |
+  |---|---|---|---|---|---|
+  | sem grafo | 2,2 | 4,6 | 4,0 | 6,3 | 6,7 |
+  | com grafo | 4,1 | 6,2 | 5,7 | 8,5 | 8,5 |
+
+### Onde está cada parte do pôster
+
+Todos os caminhos são relativos a [av1/](av1/).
+
+| no pôster | script |
+|---|---|
+| Figura 1, âncoras e grafo | [amostra_brasil/escolher_ancoras.py](av1/amostra_brasil/escolher_ancoras.py), [experimentos/figura_grafo.py](av1/experimentos/figura_grafo.py) |
+| Dados, 8,6 milhões de dias | [amostra_brasil/gerar_dataset_amostra.py](av1/amostra_brasil/gerar_dataset_amostra.py) |
+| Preditores da âncora e das vizinhas | [experimentos/montar_features.py](av1/experimentos/montar_features.py) |
+| Método, grade de 24 combinações e validação | [experimentos/treinar_p90.py](av1/experimentos/treinar_p90.py), [experimentos/validacao_espacial.py](av1/experimentos/validacao_espacial.py) |
+| Tabela 1, ganho no teste | [experimentos/comparar_desenhos.py](av1/experimentos/comparar_desenhos.py) |
+| Figura 2, convergência e vorticidade no SHAP | [experimentos/shap_teste.py](av1/experimentos/shap_teste.py) |
+| Figura 3, modelo do Norte aplicado ao Sul | [experimentos/matriz_regioes.py](av1/experimentos/matriz_regioes.py), [experimentos/transferencia_shap.py](av1/experimentos/transferencia_shap.py) |
+| Tabela 2, explicação local de quatro dias | [experimentos/shap_local.py](av1/experimentos/shap_local.py) |
+
+O primeiro experimento da versão estendida, a floresta aleatória que estima a chuva do Sul
+no mesmo dia, está em R, nas pastas [av1/R atualizado/](<av1/R atualizado/>) e
+[av1/R atualizado pdp e ice/](<av1/R atualizado pdp e ice/>).
+
+### Como reproduzir
+
+Os dados não estão no repositório, porque passam de 14 GB. Eles são gerados a partir do
+ERA5-Land horário, que pode ser baixado no Copernicus Climate Data Store.
+
+1. Agregue o ERA5-Land horário ao dia, conforme o [DATA.md](DATA.md).
+2. Gere a amostra do Brasil e rode os experimentos, na ordem descrita em
+   [av1/LEIA-ME.md](av1/LEIA-ME.md).
+
+As dependências são gerenciadas com [uv](https://docs.astral.sh/uv/) (`uv sync`).
+
+### Como citar
+
+> Glober, O. C. B.; Pignatari, V. G.; Matias, I.; Ara, A. Explicabilidade na estimação de
+> precipitação com dados do ERA5-Land no Brasil. Pôster, 70ª Reunião Anual da Região
+> Brasileira da Sociedade Internacional de Biometria (RBras), 2026.
+
+### Outros materiais neste repositório
+
+Antes do estudo do Brasil, o projeto começou com uma única célula sobre Curitiba, em
+atividades da disciplina de Aprendizado de Máquina Explicável.
+
+| pasta | o que é |
+|---|---|
+| [at2/](at2/) | tabela diária de Curitiba e árvore de decisão |
+| [at3/](at3/) | chuva forte em Curitiba, com boosting quantílico e CP, ICE, LIME e SHAP |
+| [commons/](commons/) | código comum às duas atividades |
+| [scripts/](scripts/) | agregação do ERA5-Land horário ao dia e à semana |
+| [notebooks/](notebooks/), [figures/](figures/) | análise exploratória e animações |
+| [DATA.md](DATA.md) | as variáveis do ERA5-Land e como elas são agregadas (em inglês) |
+
+---
+
+## English
+
+### Main message
+
+SHAP shows that each Brazilian region relies on different signals to predict heavy rain,
+which helps explain why models trained in the North fail in the South.
+
+Start with the [poster](papers/rbras70_poster.pdf) for the overview. The
+[extended version](papers/av1_artigo.pdf) (in Portuguese) has the full method, the
+validation, all figures and a first experiment that estimates same-day rain from the
+neighbours alone.
+
+### In short
+
+- **Data.** Daily ERA5-Land at 0.1°, 1980 to 2025, with 512 anchors at the municipal seats
+  (IBGE), each linked to 8 neighbours 123 to 145 km away.
+- **Target.** The 90th percentile (p90) of next-day rain on days with 10 mm or more,
+  predicted from the previous day only, without latitude, longitude or altitude.
+- **Model.** Quantile gradient boosting, one model per region, with and without the graph
+  features, validated on blocks of years and on anchors left out of training.
+- **Result.** On the 2015 to 2025 test, the gain over local climatology is as follows.
+
+  | | N | NE | CW | SE | S |
+  |---|---|---|---|---|---|
+  | without graph | 2.2 | 4.6 | 4.0 | 6.3 | 6.7 |
+  | with graph | 4.1 | 6.2 | 5.7 | 8.5 | 8.5 |
+
+### Where to find each part
+
+The code is in [av1/](av1/). The table in the Portuguese section above maps each figure and
+table of the poster to the script that produces it, and
+[av1/LEIA-ME.md](av1/LEIA-ME.md) gives the order to run them. The first experiment of the
+extended version (a random forest in R) is in the two `av1/R atualizado*` folders.
+
+### Reproducing
+
+The data is not in the repository (over 14 GB). It is rebuilt from hourly ERA5-Land,
+available from the Copernicus Climate Data Store. Aggregate it to daily files as described
+in [DATA.md](DATA.md), then follow [av1/LEIA-ME.md](av1/LEIA-ME.md). Dependencies are
+managed with [uv](https://docs.astral.sh/uv/) (`uv sync`).
+
+### Other material
+
+The project started from a single ERA5-Land cell over Curitiba, in coursework for an
+explainable machine learning class: [at2/](at2/) and [at3/](at3/), with shared code in
+[commons/](commons/). [DATA.md](DATA.md) documents the ERA5-Land variables and the
+daily and weekly aggregation.

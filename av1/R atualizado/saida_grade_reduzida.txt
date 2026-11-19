@@ -1,0 +1,32 @@
+período: 2012-01-01 a 2025-12-30 
+linhas: 306780  colunas: 68 
+bloco 1: treino 2012 até 2013 sem o grupo 0 (32164 linhas), valida 2014-2015 no grupo 0 (11680 linhas)
+bloco 2: treino 2012 até 2015 sem o grupo 1 (67206 linhas), valida 2016-2017 no grupo 1 (10234 linhas)
+bloco 3: treino 2012 até 2017 sem o grupo 2 (109600 linhas), valida 2018-2019 no grupo 2 (7300 linhas)
+bloco 4: treino 2012 até 2019 sem o grupo 3 (140256 linhas), valida 2020-2021 no grupo 3 (8772 linhas)
+bloco 5: treino 2012 até 2021 sem o grupo 4 (189956 linhas), valida 2022-2023 no grupo 4 (5840 linhas)
+treino final: 262980  teste: 43800 
+1/1/2016 no ano: 2016 
+
+Sequencia de 1 de 6 combinações de parâmetros sendo avaliada
+Sequencia de 2 de 6 combinações de parâmetros sendo avaliada
+Sequencia de 3 de 6 combinações de parâmetros sendo avaliada
+Sequencia de 4 de 6 combinações de parâmetros sendo avaliada
+Sequencia de 5 de 6 combinações de parâmetros sendo avaliada
+Sequencia de 6 de 6 combinações de parâmetros sendo avaliada
+  numtrees mtry min.node.size  splitrule     RMSE      MAE        R2
+1      100   62            50 extratrees 3.821659 1.646809 0.8316720
+2      100   32            50   variance 3.828399 1.656989 0.8305519
+3      100   62            50   variance 3.866105 1.673091 0.8270643
+4      100   32            50 extratrees 3.877868 1.673081 0.8280840
+5      100    2            50   variance 4.728063 2.191821 0.7531570
+6      100    2            50 extratrees 5.000184 2.463012 0.7237610
+  numtrees mtry min.node.size  splitrule
+1      100   62            50 extratrees
+
+Resultado no teste (2024-2025):
+  num.trees mtry min.node.size  splitrule     RMSE      MAE        R2
+1       100   62            50 extratrees 3.741661 1.537406 0.8577542
+
+tempo total: 71.9 min
+fim 0

@@ -36,3 +36,28 @@ at3/export/
 
 # Relatório da AT3: a versão de trabalho fica no Overleaf
 at3/relatorio/
+
+# xml
+*.xml
+
+# Docs
+docs/*
+
+# Dataset amostrado no Brasil (AV1): dados grandes e downloads do IBGE
+av1/amostra_brasil/dados/*.parquet
+av1/amostra_brasil/dados/ibge/
+av1/amostra_brasil/dados/cache/
+av1/amostra_brasil/dados_150/*.parquet
+av1/amostra_brasil/dados_150/cache/
+
+# Workspace
+.superpowers/
+
+# Datasources
+*.csv
+*.parquet
+*.json
+*.zip
+
+# Experimento 1 (R): modelo e partições salvos, dados e não código
+*.rds
